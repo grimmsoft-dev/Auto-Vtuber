@@ -6,6 +6,8 @@
 //                     (console games), or glance around when there is none
 //   CompanionHeadY    head up/down: same as LookY, but looking up is halved
 //   CompanionTilt     small idle head tilt
+// While the collab partner picked in the tray menu talks in your Discord call
+// (and the mouse is idle), she looks towards their side instead.
 // Lives in the tray and exits when VTube Studio closes.
 #include <windows.h>
 #include <shellapi.h>
@@ -23,7 +25,9 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <map>
 #include "GameWatch.hpp"
+#include "DiscordVoice.hpp"
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
@@ -40,10 +44,29 @@ static std::wstring pendingBalloon;
 static HWND trayWindow = nullptr;
 static fs::path dataDir;
 static game::Watcher gameWatcher;
+static discord::Voice discordVoice;
+static HWND setupWindow = nullptr;
 
-// settings.txt holds one line: watchGame=0 or 1.
-static void loadSettings() { std::ifstream f(dataDir / L"settings.txt"); std::string line; std::getline(f, line); gameWatcher.enabled = line != "watchGame=0"; }
-static void saveSettings() { std::ofstream(dataDir / L"settings.txt") << (gameWatcher.enabled ? "watchGame=1" : "watchGame=0"); }
+// Collab partner (Discord user) and which side of the screen their model is on.
+static std::mutex partnerLock;
+static std::string partnerId, partnerName;
+static std::atomic<int> partnerSide{1}; // -1 left, +1 right
+
+// settings.txt: key=value lines (UTF-8).
+static void loadSettings() {
+    std::ifstream f(dataDir / L"settings.txt"); std::map<std::string, std::string> values; std::string line;
+    while(std::getline(f, line)) { auto eq = line.find('='); if(eq != std::string::npos) values[line.substr(0, eq)] = line.substr(eq + 1); }
+    gameWatcher.enabled = values["watchGame"] != "0";
+    partnerSide = values["partnerSide"] == "left" ? -1 : 1;
+    std::lock_guard<std::mutex> g(partnerLock);
+    partnerId = values["partnerId"]; partnerName = values["partnerName"];
+    discordVoice.setPartner(partnerId);
+}
+static void saveSettings() {
+    std::lock_guard<std::mutex> g(partnerLock);
+    std::ofstream(dataDir / L"settings.txt") << "watchGame=" << (gameWatcher.enabled ? 1 : 0) << "\npartnerSide=" << (partnerSide < 0 ? "left" : "right")
+        << "\npartnerId=" << partnerId << "\npartnerName=" << partnerName << "\n";
+}
 
 static void setStatus(const std::wstring& text, bool balloon = false) {
     std::lock_guard<std::mutex> lock(statusLock);
@@ -182,6 +205,8 @@ class Gaze {
     float x = 0, y = 0, vx = 0, vy = 0, tilt = 0, tiltV = 0;
     float startle = 0, startleSide = 1;
     unsigned lastStartles = 0;
+    double listenIn = 0;
+    float listenX = 0, listenY = 0;
     uint32_t randomState = 0x629bf031;
     float random() { randomState ^= randomState << 13; randomState ^= randomState >> 17; randomState ^= randomState << 5; return float(randomState >> 8) / 16777216.f; }
     float sign() { return random() < 0.5f ? -1.f : 1.f; }
@@ -194,7 +219,8 @@ class Gaze {
 public:
     float lookX = 0, lookY = 0, headY = 0, headTilt = 0;
     explicit Gaze(uint32_t seed) { randomState = seed ? seed : 0x629bf031; }
-    void update(float dt, float mouseX, float mouseY, bool idle, const game::Focus& focus) {
+    // listenSide: -1/+1 while the collab partner on that side of the screen is talking, else 0.
+    void update(float dt, float mouseX, float mouseY, bool idle, const game::Focus& focus, int listenSide) {
         time += dt;
         // A loud moment in the game: a quick little jolt of the head.
         if(focus.startles != lastStartles) { lastStartles = focus.startles; startle = 1; startleSide = sign(); }
@@ -207,6 +233,13 @@ public:
             // shifts to the live mouse. Once settled, output is the raw mouse.
             smooth(x, vx, mouseX, 3.5f, dt); smooth(y, vy, mouseY, 3.5f, dt);
             glanceIn = 0.6; idleTilt = 0;
+        } else if(listenSide != 0) {
+            // The collab partner is talking: look their way, with small drifts
+            // every second or so so it doesn't look frozen.
+            listenIn -= dt;
+            if(listenIn <= 0) { listenX = (random() - 0.5f) * 0.16f; listenY = 0.05f + (random() - 0.5f) * 0.12f; listenIn = 0.8 + random() * 1.4; }
+            smooth(x, vx, listenSide * 0.7f + listenX, 4.f, dt); smooth(y, vy, listenY, 4.f, dt);
+            glanceIn = 1.0; idleTilt = 0;
         } else if(focus.has) {
             // Watching the console game: look at the action. She sits bottom-left
             // on stream, so the whole game picture maps to camera right (left
@@ -303,7 +336,8 @@ static DWORD WINAPI worker(void*) {
             POINT cursor{};
             if(GetCursorPos(&cursor) && std::abs(cursor.x - lastCursor.x) + std::abs(cursor.y - lastCursor.y) >= 2) { lastCursor = cursor; lastMove = now; }
             float mouseX = 0, mouseY = 0; area.normalize(lastCursor, mouseX, mouseY);
-            gaze.update(dt, mouseX, mouseY, std::chrono::duration<double>(now - lastMove).count() >= IdleAfterSeconds, gameWatcher.current());
+            gaze.update(dt, mouseX, mouseY, std::chrono::duration<double>(now - lastMove).count() >= IdleAfterSeconds, gameWatcher.current(),
+                discordVoice.partnerTalking() ? partnerSide.load() : 0);
             char data[400];
             snprintf(data, sizeof(data), "{\"faceFound\":false,\"mode\":\"set\",\"parameterValues\":[{\"id\":\"CompanionLookX\",\"value\":%.4f},{\"id\":\"CompanionLookY\",\"value\":%.4f},{\"id\":\"CompanionHeadY\",\"value\":%.4f},{\"id\":\"CompanionTilt\",\"value\":%.4f}]}",
                 gaze.lookX, gaze.lookY, gaze.headY, gaze.headTilt);
@@ -315,6 +349,66 @@ static DWORD WINAPI worker(void*) {
     PostMessageW(trayWindow, WM_CLOSE, 0, 0);
     return 0;
 }
+
+// Small window for the Discord application's client ID and secret.
+enum { SetupIdEdit = 201, SetupSecretEdit, SetupSave, SetupCancel };
+static LRESULT CALLBACK setupProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    switch(msg) {
+    case WM_CREATE: {
+        UINT dpi = GetDpiForWindow(h);
+        auto px = [&](int v) { return MulDiv(v, int(dpi), 96); };
+        NONCLIENTMETRICSW metrics{sizeof(metrics)};
+        SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi);
+        HFONT font = CreateFontIndirectW(&metrics.lfMessageFont);
+        SetPropW(h, L"font", font);
+        auto add = [&](const wchar_t* type, const wchar_t* text, DWORD style, int x, int y, int width, int height, int id) {
+            HWND c = CreateWindowExW(0, type, text, WS_CHILD | WS_VISIBLE | style, px(x), px(y), px(width), px(height), h, reinterpret_cast<HMENU>(INT_PTR(id)), nullptr, nullptr);
+            SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            return c;
+        };
+        add(L"STATIC", L"Paste your Discord application's Client ID and Client Secret (Discord Developer Portal > your application > OAuth2). The README has the setup steps.", 0, 12, 12, 396, 48, 0);
+        add(L"STATIC", L"Client ID", 0, 12, 66, 200, 20, 0);
+        HWND id = add(L"EDIT", discord::widen(discordVoice.clientId()).c_str(), WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 12, 86, 396, 24, SetupIdEdit);
+        add(L"STATIC", L"Client Secret", 0, 12, 118, 200, 20, 0);
+        add(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, 12, 138, 396, 24, SetupSecretEdit);
+        add(L"BUTTON", L"Save", WS_TABSTOP | BS_DEFPUSHBUTTON, 228, 178, 86, 28, SetupSave);
+        add(L"BUTTON", L"Cancel", WS_TABSTOP, 322, 178, 86, 28, SetupCancel);
+        SetFocus(id);
+        return 0;
+    }
+    case WM_COMMAND:
+        if(LOWORD(w) == SetupSave || LOWORD(w) == IDOK) {
+            auto text = [&](int control) {
+                wchar_t buffer[512] = {}; GetDlgItemTextW(h, control, buffer, 512);
+                std::string s = discord::narrow(buffer);
+                s.erase(0, s.find_first_not_of(" \t")); s.erase(s.find_last_not_of(" \t") + 1);
+                return s;
+            };
+            auto id = text(SetupIdEdit), secret = text(SetupSecretEdit);
+            if(id.empty() || secret.empty()) { MessageBoxW(h, L"Enter both the Client ID and the Client Secret.", L"Set up Discord", MB_ICONINFORMATION); return 0; }
+            discordVoice.setCredentials(id, secret);
+            DestroyWindow(h);
+        } else if(LOWORD(w) == SetupCancel || LOWORD(w) == IDCANCEL) DestroyWindow(h);
+        return 0;
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY: DeleteObject(static_cast<HFONT>(RemovePropW(h, L"font"))); setupWindow = nullptr; return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+static void openSetup() {
+    if(setupWindow) { SetForegroundWindow(setupWindow); return; }
+    UINT dpi = GetDpiForSystem();
+    RECT r{0, 0, MulDiv(420, int(dpi), 96), MulDiv(218, int(dpi), 96)};
+    AdjustWindowRectExForDpi(&r, WS_CAPTION | WS_SYSMENU, FALSE, 0, dpi);
+    int width = r.right - r.left, height = r.bottom - r.top;
+    setupWindow = CreateWindowExW(0, L"AutoVtuberDiscordSetup", L"Set up Discord", WS_CAPTION | WS_SYSMENU,
+        (GetSystemMetrics(SM_CXSCREEN) - width) / 2, (GetSystemMetrics(SM_CYSCREEN) - height) / 2, width, height, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    ShowWindow(setupWindow, SW_SHOW);
+    SetForegroundWindow(setupWindow);
+}
+
+enum { MenuStop = 1, MenuWatchGame, MenuSetupDiscord, MenuPartnerLeft, MenuPartnerRight, MenuNoPartner = 300, MenuFirstPerson = 301 };
 
 static LRESULT CALLBACK trayProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     static NOTIFYICONDATAW icon{};
@@ -344,13 +438,45 @@ static LRESULT CALLBACK trayProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             HMENU menu = CreatePopupMenu();
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status.c_str());
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, gameWatcher.statusText().c_str());
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, discordVoice.statusText().c_str());
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(menu, MF_STRING | (gameWatcher.enabled ? MF_CHECKED : 0), 2, L"Watch the game in NitLink when the mouse is idle");
-            AppendMenuW(menu, MF_STRING, 1, L"Stop gaze helper (VTube Studio keeps running)");
+            AppendMenuW(menu, MF_STRING | (gameWatcher.enabled ? MF_CHECKED : 0), MenuWatchGame, L"Watch the game in NitLink when the mouse is idle");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            // Collab partner: pick them from the people in your Discord call.
+            auto people = discordVoice.people();
+            std::string currentId, currentName;
+            { std::lock_guard<std::mutex> g(partnerLock); currentId = partnerId; currentName = partnerName; }
+            HMENU partners = CreatePopupMenu();
+            AppendMenuW(partners, MF_STRING | (currentId.empty() ? MF_CHECKED : 0), MenuNoPartner, L"Nobody");
+            bool listed = false;
+            for(size_t i = 0; i < people.size() && i < 200; ++i) {
+                bool chosen = people[i].id == currentId; listed |= chosen;
+                AppendMenuW(partners, MF_STRING | (chosen ? MF_CHECKED : 0), MenuFirstPerson + UINT(i), discord::widen(people[i].name).c_str());
+            }
+            if(!currentId.empty() && !listed) AppendMenuW(partners, MF_STRING | MF_CHECKED | MF_GRAYED, 0, (discord::widen(currentName) + L" (not in this call)").c_str());
+            if(people.empty()) AppendMenuW(partners, MF_STRING | MF_GRAYED, 0, L"Join a Discord voice call to see people here");
+            auto partnerLabel = L"Collab partner: " + (currentId.empty() ? std::wstring(L"nobody") : discord::widen(currentName));
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(partners), partnerLabel.c_str());
+            AppendMenuW(menu, MF_STRING | (partnerSide < 0 ? MF_CHECKED : 0), MenuPartnerLeft, L"Partner is on the left of the screen");
+            AppendMenuW(menu, MF_STRING | (partnerSide > 0 ? MF_CHECKED : 0), MenuPartnerRight, L"Partner is on the right of the screen");
+            AppendMenuW(menu, MF_STRING, MenuSetupDiscord, discordVoice.configured() ? L"Set up Discord again..." : L"Set up Discord...");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, MenuStop, L"Stop gaze helper (VTube Studio keeps running)");
             POINT p; GetCursorPos(&p); SetForegroundWindow(h);
-            switch(TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, h, nullptr)) {
-            case 1: PostMessageW(h, WM_CLOSE, 0, 0); break;
-            case 2: gameWatcher.enabled = !gameWatcher.enabled; saveSettings(); break;
+            UINT choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, h, nullptr);
+            auto choosePartner = [](const std::string& id, const std::string& name) {
+                { std::lock_guard<std::mutex> g(partnerLock); partnerId = id; partnerName = name; }
+                discordVoice.setPartner(id); saveSettings();
+            };
+            switch(choice) {
+            case MenuStop: PostMessageW(h, WM_CLOSE, 0, 0); break;
+            case MenuWatchGame: gameWatcher.enabled = !gameWatcher.enabled; saveSettings(); break;
+            case MenuSetupDiscord: openSetup(); break;
+            case MenuPartnerLeft: partnerSide = -1; saveSettings(); break;
+            case MenuPartnerRight: partnerSide = 1; saveSettings(); break;
+            case MenuNoPartner: choosePartner({}, {}); break;
+            default:
+                if(choice >= MenuFirstPerson && choice - MenuFirstPerson < people.size()) choosePartner(people[choice - MenuFirstPerson].id, people[choice - MenuFirstPerson].name);
             }
             DestroyMenu(menu);
         }
@@ -374,17 +500,25 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     std::error_code ignored; fs::create_directories(dataDir, ignored);
     loadSettings();
     gameWatcher.start(dataDir / L"gamewatch.log");
+    discordVoice.start(dataDir / L"discord.dat");
     WNDCLASSW wc{}; wc.lpfnWndProc = trayProc; wc.hInstance = instance; wc.lpszClassName = L"LilyVTubeLauncherTray";
     RegisterClassW(&wc);
+    WNDCLASSW setup{}; setup.lpfnWndProc = setupProc; setup.hInstance = instance; setup.lpszClassName = L"AutoVtuberDiscordSetup";
+    setup.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_3DFACE + 1); setup.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassW(&setup);
     // Hidden (never shown) top-level window, so the tray menu can take focus and dismiss properly.
     trayWindow = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Lily VTube launcher", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
     HANDLE thread = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
     MSG msg;
-    while(GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    while(GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if(setupWindow && IsDialogMessageW(setupWindow, &msg)) continue; // Tab/Enter/Esc in the setup window
+        TranslateMessage(&msg); DispatchMessageW(&msg);
+    }
     stopping = true;
     // The worker may be blocked waiting for the Allow click; don't hang on exit.
     if(thread) { WaitForSingleObject(thread, 1500); CloseHandle(thread); }
     gameWatcher.stop();
+    discordVoice.stop();
     if(single) CloseHandle(single);
     return 0;
 }
