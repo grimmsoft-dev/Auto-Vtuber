@@ -1,4 +1,4 @@
-# VTube Gaze Helper
+# Auto-Vtuber
 
 A one-click launcher and plugin for [VTube Studio](https://store.steampowered.com/app/1325860/VTube_Studio/) on Windows, for streaming without a webcam. Double-click it and it:
 
