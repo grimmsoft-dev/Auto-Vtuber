@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.25)
+project(LilyVTubeLauncher LANGUAGES CXX)
+set(CMAKE_CONFIGURATION_TYPES Debug Release CACHE STRING "" FORCE)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Static runtime: the exe runs on another PC without the Visual C++ redistributable.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_executable(LilyVTubeLauncher WIN32 main.cpp)
+target_compile_definitions(LilyVTubeLauncher PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(LilyVTubeLauncher PRIVATE /utf-8 /W4 /permissive- /bigobj)
+target_link_libraries(LilyVTubeLauncher PRIVATE winhttp shell32 ole32 d3d11 dxgi mmdevapi windowsapp)
